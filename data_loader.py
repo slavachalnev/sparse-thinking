@@ -64,8 +64,15 @@ class ActivationsDataLoader:
         Returns:
             Tensor of shape [batch_size, seq_len, d_in]
         """
-        # Get texts for the given indices
-        texts = [self.dataset[idx]["text"] for idx in indices]
+        # Get texts for the given indices - extract from conversations
+        texts = []
+        for idx in indices:
+            conversations = self.dataset[idx]["conversations"]
+            # Use the first user message in each conversation
+            for message in conversations:
+                if message["from"] == "user":
+                    texts.append(message["value"])
+                    break
         
         # Process texts in batches based on llm_batch_size
         all_activations = []
