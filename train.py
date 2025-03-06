@@ -6,7 +6,7 @@ import json
 from tqdm import tqdm
 import wandb
 import numpy as np
-from data_loader import load_data_and_representations
+from data_loader import ActivationsDataLoader
 from model import SplitSAE
 
 def train(cfg):
@@ -21,8 +21,8 @@ def train(cfg):
     # Set random seed for reproducibility
     torch.manual_seed(cfg["seed"])
     
-    # Load data
-    train_loader, val_loader = load_data_and_representations(cfg)
+    # Initialize the data loader
+    data_loader = ActivationsDataLoader(cfg)
     
     # Initialize the model
     model = SplitSAE(cfg)
@@ -41,6 +41,9 @@ def train(cfg):
     # Create directory for saving checkpoints
     os.makedirs(cfg.get("checkpoint_dir", "checkpoints"), exist_ok=True)
     
+    # Get number of batches for progress tracking
+    batches_per_epoch = data_loader.get_num_batches()
+    
     for epoch in range(num_epochs):
         # Training
         model.train()
@@ -49,8 +52,9 @@ def train(cfg):
         epoch_unique_l0 = 0
         epoch_recon_loss = 0
         
-        for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} - Training"):
-            # No need to move batch to device as it's already on device
+        for _ in tqdm(range(batches_per_epoch), desc=f"Epoch {epoch+1}/{num_epochs}"):
+            # Get next batch of activations
+            batch = data_loader.get_next_batch()
             
             # Forward pass
             losses = model.get_losses(batch)
@@ -70,58 +74,25 @@ def train(cfg):
             epoch_unique_l0 += losses["unique_l0"].item()
         
         # Average metrics
-        epoch_loss /= len(train_loader)
-        epoch_recon_loss /= len(train_loader)
-        epoch_unique_l1 /= len(train_loader)
-        epoch_unique_l0 /= len(train_loader)
-        
-        # Validation
-        model.eval()
-        val_loss = 0
-        val_recon_loss = 0
-        val_unique_l1 = 0
-        val_unique_l0 = 0
-        
-        with torch.no_grad():
-            for batch in tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} - Validation"):
-                # No need to move batch to device as it's already on device
-                
-                # Forward pass
-                losses = model.get_losses(batch)
-                
-                # Compute total loss
-                total_loss = losses["recon_loss"] + cfg["l1_coef"] * losses["unique_l1"]
-                
-                # Track metrics
-                val_loss += total_loss.item()
-                val_recon_loss += losses["recon_loss"].item()
-                val_unique_l1 += losses["unique_l1"].item()
-                val_unique_l0 += losses["unique_l0"].item()
-            
-            # Average metrics
-            val_loss /= len(val_loader)
-            val_recon_loss /= len(val_loader)
-            val_unique_l1 /= len(val_loader)
-            val_unique_l0 /= len(val_loader)
+        epoch_loss /= batches_per_epoch
+        epoch_recon_loss /= batches_per_epoch
+        epoch_unique_l1 /= batches_per_epoch
+        epoch_unique_l0 /= batches_per_epoch
         
         # Log metrics to wandb
         if cfg.get("use_wandb", True):
             wandb.log({
                 "epoch": epoch + 1,
-                "train/loss": epoch_loss,
-                "train/recon_loss": epoch_recon_loss,
-                "train/unique_l1": epoch_unique_l1,
-                "train/unique_l0": epoch_unique_l0,
-                "val/loss": val_loss,
-                "val/recon_loss": val_recon_loss,
-                "val/unique_l1": val_unique_l1,
-                "val/unique_l0": val_unique_l0,
+                "loss": epoch_loss,
+                "recon_loss": epoch_recon_loss,
+                "unique_l1": epoch_unique_l1,
+                "unique_l0": epoch_unique_l0,
             })
         
         # Print metrics
         print(f"Epoch {epoch+1}/{num_epochs} - "
-              f"Train Loss: {epoch_loss:.6f}, "
-              f"Val Loss: {val_loss:.6f}, "
+              f"Loss: {epoch_loss:.6f}, "
+              f"Recon Loss: {epoch_recon_loss:.6f}, "
               f"Unique L1: {epoch_unique_l1:.6f}, "
               f"Unique L0: {epoch_unique_l0:.6f}")
         
@@ -135,8 +106,7 @@ def train(cfg):
                 'epoch': epoch + 1,
                 'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'train_loss': epoch_loss,
-                'val_loss': val_loss,
+                'loss': epoch_loss,
             }, checkpoint_path)
             print(f"Checkpoint saved to {checkpoint_path}")
             

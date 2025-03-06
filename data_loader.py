@@ -1,153 +1,143 @@
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
 from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
-import os
 import numpy as np
+from typing import List, Dict, Any
 
-class OnDeviceActivationsDataset(Dataset):
-    def __init__(self, dataset, indices, model, tokenizer, cfg):
+class ActivationsDataLoader:
+    def __init__(self, cfg):
         """
-        Dataset class that computes activations on-demand and keeps them on device
+        Class to load text dataset and language model, and generate activation batches.
         
         Args:
-            dataset: HuggingFace dataset
-            indices: List of indices to use from the dataset
-            model: Language model to extract activations from
-            tokenizer: Tokenizer for the language model
             cfg: Configuration dictionary
         """
-        self.dataset = dataset
-        self.indices = indices
-        self.model = model
-        self.tokenizer = tokenizer
         self.cfg = cfg
         self.device = cfg["device"]
         self.layer_idx = cfg.get("layer_idx", -1)
-    
-    def __len__(self):
-        return len(self.indices)
-    
-    def __getitem__(self, idx):
-        # Get the example from the dataset
-        example_idx = self.indices[idx]
-        example = self.dataset[example_idx]
-        text = example["text"]
+        self.llm_batch_size = cfg.get("llm_batch_size", 1)
+        self.batch_size = cfg.get("batch_size", 32)
         
-        # Extract activations from the model (kept on device)
-        return self.extract_activations(text)
+        # Load dataset
+        self.dataset = load_dataset("open-thoughts/OpenThoughts-114k")["train"]
+        
+        # Load model and tokenizer
+        model_name = "deepseek-ai/DeepSeek-R1-Distill-Llama-8B"
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        
+        # Define dtype mapping
+        dtypes = {
+            "float32": torch.float32,
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+        }
+        
+        self.model = AutoModelForCausalLM.from_pretrained(
+            model_name, 
+            torch_dtype=dtypes[cfg.get("model_dtype", "float16")],
+            device_map=self.device
+        )
+        
+        # Take a subset of examples
+        num_examples = min(cfg.get("max_examples", 1000), len(self.dataset))
+        self.indices = list(range(num_examples))
+        
+        print(f"Dataset initialized with {len(self.indices)} examples")
+        
+        # Initialize iteration counter and shuffled indices
+        self._shuffle_indices()
+        self.iter_position = 0
     
-    def extract_activations(self, text):
+    def _shuffle_indices(self):
+        """Shuffle the indices to randomize batch generation"""
+        self.shuffled_indices = self.indices.copy()
+        np.random.shuffle(self.shuffled_indices)
+    
+    def get_activation_batch(self, indices):
         """
-        Extract activations from a specific layer in the model and keep them on device
+        Get a batch of activations for the given indices
         
+        Args:
+            indices: List of indices from the dataset
+            
         Returns:
-            Tensor of shape [1, seq_len, d_in] - representing a batch size of 1
+            Tensor of shape [batch_size, seq_len, d_in]
         """
-        tokens = self.tokenizer(text, return_tensors="pt").to(self.device)
+        # Get texts for the given indices
+        texts = [self.dataset[idx]["text"] for idx in indices]
         
-        # Calculate the actual layer index, converting negative indexing to positive
+        # Process texts in batches based on llm_batch_size
+        all_activations = []
+        
+        for i in range(0, len(texts), self.llm_batch_size):
+            batch_texts = texts[i:i + self.llm_batch_size]
+            batch_activations = self._process_text_batch(batch_texts)
+            all_activations.extend(batch_activations)
+            
+        # Stack all activations into a single tensor
+        # Each activation has shape [1, seq_len, d_in]
+        return torch.cat(all_activations, dim=0)
+    
+    def _process_text_batch(self, texts):
+        """
+        Process a batch of texts to extract activations
+        
+        Args:
+            texts: List of text strings
+            
+        Returns:
+            List of tensors, each with shape [1, seq_len, d_in]
+        """
+        # Tokenize all texts in the batch
+        batch_tokens = self.tokenizer(texts, padding=True, return_tensors="pt").to(self.device)
+        
+        # Calculate the actual layer index
         num_layers = self.model.config.num_hidden_layers + 1  # +1 for embedding layer
         actual_layer_idx = self.layer_idx if self.layer_idx >= 0 else num_layers + self.layer_idx
         
-        # Only compute hidden states up to the required layer to save memory
+        # Process the batch
         with torch.no_grad():
             outputs = self.model(
-                **tokens, 
+                **batch_tokens,
                 output_hidden_states=True,
                 output_attentions=False,
                 use_cache=False,
                 return_dict=True
             )
         
-        # Extract activations from specified layer and keep on device
-        # Shape: [1, seq_len, d_in]
-        hidden_states = outputs.hidden_states[actual_layer_idx]
+        # Extract activations
+        hidden_states_batch = outputs.hidden_states[actual_layer_idx]
         
-        # Ensure consistent shape [batch_size=1, seq_len, d_in]
-        if hidden_states.dim() == 2:
-            # If it's [seq_len, d_in], add batch dimension
-            hidden_states = hidden_states.unsqueeze(0)
-            
-        return hidden_states
-
-def load_data_and_representations(cfg):
-    """
-    Load the OpenThoughts-114k dataset and DeepSeek-R1-Distill-Llama-8B model,
-    and prepare on-device datasets for training.
+        # Split the batch back into individual examples
+        return [hidden_states_batch[j:j+1] for j in range(hidden_states_batch.size(0))]
     
-    Args:
-        cfg: Configuration dictionary containing parameters
+    def get_next_batch(self):
+        """
+        Get the next batch of activations
         
-    Returns:
-        train_loader: DataLoader for training
-        val_loader: DataLoader for validation
-    """
-    # Load OpenThoughts-114k dataset
-    dataset = load_dataset("open-thoughts/OpenThoughts-114k")["train"]
-    
-    # Load DeepSeek-R1-Distill-Llama-8B model and tokenizer
-    device = cfg["device"]
-    model_name = "deepseek-ai/DeepSeek-R1-Distill-Llama-8B"
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-    
-    # Define dtype mapping
-    dtypes = {
-        "float32": torch.float32,
-        "float16": torch.float16,
-        "bfloat16": torch.bfloat16,
-    }
-    
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name, 
-        torch_dtype=dtypes[cfg.get("model_dtype", "float16")],
-        device_map=device
-    )
-    
-    # Take a subset of examples (adjust based on resources)
-    num_examples = min(cfg.get("max_examples", 1000), len(dataset))
-    all_indices = list(range(num_examples))
-    
-    # Split into training and validation sets
-    split_idx = int(num_examples * cfg.get("train_ratio", 0.8))
-    train_indices = all_indices[:split_idx]
-    val_indices = all_indices[split_idx:]
-    
-    print(f"Creating dataset with {len(train_indices)} training examples and {len(val_indices)} validation examples")
-    
-    # Create datasets that compute activations on-demand
-    train_dataset = OnDeviceActivationsDataset(dataset, train_indices, model, tokenizer, cfg)
-    val_dataset = OnDeviceActivationsDataset(dataset, val_indices, model, tokenizer, cfg)
-    
-    # Define collate function to properly batch tensors
-    def collate_activations(batch):
+        Returns:
+            Tensor of shape [batch_size, seq_len, d_in]
         """
-        Custom collate function to batch together tensors while ensuring
-        consistent shape [batch_size, seq_len, d_in]
-        """
-        # Each item in batch is already [1, seq_len, d_in]
-        # We need to concatenate along batch dimension
-        return torch.cat(batch, dim=0)
+        # Get the next batch of indices
+        start_pos = self.iter_position
+        end_pos = min(start_pos + self.batch_size, len(self.shuffled_indices))
+        batch_indices = self.shuffled_indices[start_pos:end_pos]
+        
+        # Update position for next call
+        self.iter_position = end_pos
+        
+        # Reshuffle and reset position if we've gone through all indices
+        if self.iter_position >= len(self.shuffled_indices):
+            self._shuffle_indices()
+            self.iter_position = 0
+        
+        return self.get_activation_batch(batch_indices)
     
-    # Create dataloaders with fewer workers for GPU dataset and custom collate function
-    # When keeping data on device, we need to use fewer workers to avoid CUDA issues
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=cfg["batch_size"],
-        shuffle=True,
-        # For on-device computation, using multiple workers can cause CUDA errors
-        # so we use fewer workers or none
-        num_workers=0,
-        collate_fn=collate_activations
-    )
+    def get_data_size(self):
+        """Get the number of examples"""
+        return len(self.indices)
     
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=cfg["batch_size"],
-        shuffle=False,
-        num_workers=0,
-        collate_fn=collate_activations
-    )
-    
-    return train_loader, val_loader
+    def get_num_batches(self):
+        """Get the number of batches in one epoch"""
+        return (len(self.indices) + self.batch_size - 1) // self.batch_size
