@@ -9,7 +9,7 @@ DTYPES = {
     "bfloat16": torch.bfloat16,
 }
 
-class SAEReasoningModel(nn.Module):
+class SplitSAE(nn.Module):
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
