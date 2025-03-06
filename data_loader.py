@@ -6,53 +6,76 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 import os
 import numpy as np
 
-class ReasoningStepDataset(Dataset):
-    def __init__(self, representations, cfg):
+class OnDeviceActivationsDataset(Dataset):
+    def __init__(self, dataset, indices, model, tokenizer, cfg):
         """
-        Dataset class for reasoning step representations
+        Dataset class that computes activations on-demand and keeps them on device
         
         Args:
-            representations: Tensor of shape [num_examples, num_steps, d_in]
+            dataset: HuggingFace dataset
+            indices: List of indices to use from the dataset
+            model: Language model to extract activations from
+            tokenizer: Tokenizer for the language model
             cfg: Configuration dictionary
         """
-        self.representations = representations
+        self.dataset = dataset
+        self.indices = indices
+        self.model = model
+        self.tokenizer = tokenizer
         self.cfg = cfg
+        self.device = cfg["device"]
+        self.layer_idx = cfg.get("layer_idx", -1)
     
     def __len__(self):
-        return len(self.representations)
+        return len(self.indices)
     
     def __getitem__(self, idx):
-        return self.representations[idx]
-
-def extract_activations(model, tokenizer, text, layer_idx=-1, device="cuda"):
-    """
-    Extract activations from a specific layer in the model
-    
-    Args:
-        model: DeepSeek model
-        tokenizer: DeepSeek tokenizer
-        text: Input text
-        layer_idx: Index of the layer to extract activations from (-1 for last layer)
-        device: Device to run the model on
+        # Get the example from the dataset
+        example_idx = self.indices[idx]
+        example = self.dataset[example_idx]
+        text = example["text"]
         
-    Returns:
-        Tensor containing activations for each reasoning step
-    """
-    tokens = tokenizer(text, return_tensors="pt").to(device)
+        # Extract activations from the model (kept on device)
+        return self.extract_activations(text)
     
-    # Get all hidden states
-    with torch.no_grad():
-        outputs = model(**tokens, output_hidden_states=True)
-    
-    # Extract activations from specified layer
-    hidden_states = outputs.hidden_states[layer_idx]
-    
-    return hidden_states.cpu()
+    def extract_activations(self, text):
+        """
+        Extract activations from a specific layer in the model and keep them on device
+        
+        Returns:
+            Tensor of shape [1, seq_len, d_in] - representing a batch size of 1
+        """
+        tokens = self.tokenizer(text, return_tensors="pt").to(self.device)
+        
+        # Calculate the actual layer index, converting negative indexing to positive
+        num_layers = self.model.config.num_hidden_layers + 1  # +1 for embedding layer
+        actual_layer_idx = self.layer_idx if self.layer_idx >= 0 else num_layers + self.layer_idx
+        
+        # Only compute hidden states up to the required layer to save memory
+        with torch.no_grad():
+            outputs = self.model(
+                **tokens, 
+                output_hidden_states=True,
+                output_attentions=False,
+                use_cache=False,
+                return_dict=True
+            )
+        
+        # Extract activations from specified layer and keep on device
+        # Shape: [1, seq_len, d_in]
+        hidden_states = outputs.hidden_states[actual_layer_idx]
+        
+        # Ensure consistent shape [batch_size=1, seq_len, d_in]
+        if hidden_states.dim() == 2:
+            # If it's [seq_len, d_in], add batch dimension
+            hidden_states = hidden_states.unsqueeze(0)
+            
+        return hidden_states
 
-def load_data_and_model(cfg):
+def load_data_and_representations(cfg):
     """
     Load the OpenThoughts-114k dataset and DeepSeek-R1-Distill-Llama-8B model,
-    and prepare the data for training.
+    and prepare on-device datasets for training.
     
     Args:
         cfg: Configuration dictionary containing parameters
@@ -60,10 +83,9 @@ def load_data_and_model(cfg):
     Returns:
         train_loader: DataLoader for training
         val_loader: DataLoader for validation
-        model_sae: Initialized SplitSAE model
     """
     # Load OpenThoughts-114k dataset
-    dataset = load_dataset("open-thoughts/OpenThoughts-114k")
+    dataset = load_dataset("open-thoughts/OpenThoughts-114k")["train"]
     
     # Load DeepSeek-R1-Distill-Llama-8B model and tokenizer
     device = cfg["device"]
@@ -83,75 +105,49 @@ def load_data_and_model(cfg):
         device_map=device
     )
     
-    # Process examples through the model
-    representations = []
-    
-    # Check if cached representations exist
-    cache_path = cfg.get("cache_path", "representations_cache.pt")
-    if os.path.exists(cache_path) and cfg.get("use_cache", True):
-        print(f"Loading cached representations from {cache_path}")
-        representations = torch.load(cache_path)
-    else:
-        print("Processing examples and extracting representations...")
-        # Take a subset for processing (adjust based on resources)
-        num_examples = min(cfg.get("max_examples", 1000), len(dataset["train"]))
-        
-        for i in range(num_examples):
-            example = dataset["train"][i]
-            # Extract reasoning problem text
-            text = example["text"]
-            
-            # Extract activations from the model
-            activations = extract_activations(
-                model, 
-                tokenizer, 
-                text, 
-                layer_idx=cfg.get("layer_idx", -1),
-                device=device
-            )
-            
-            # Store as representation
-            representations.append(activations)
-            
-            if (i + 1) % 10 == 0:
-                print(f"Processed {i + 1}/{num_examples} examples")
-        
-        # Stack representations
-        representations = torch.stack(representations)
-        
-        # Cache representations
-        if cfg.get("cache_representations", True):
-            print(f"Caching representations to {cache_path}")
-            torch.save(representations, cache_path)
+    # Take a subset of examples (adjust based on resources)
+    num_examples = min(cfg.get("max_examples", 1000), len(dataset))
+    all_indices = list(range(num_examples))
     
     # Split into training and validation sets
-    split_idx = int(len(representations) * cfg.get("train_ratio", 0.8))
-    train_representations = representations[:split_idx]
-    val_representations = representations[split_idx:]
+    split_idx = int(num_examples * cfg.get("train_ratio", 0.8))
+    train_indices = all_indices[:split_idx]
+    val_indices = all_indices[split_idx:]
     
-    # Create datasets
-    train_dataset = ReasoningStepDataset(train_representations, cfg)
-    val_dataset = ReasoningStepDataset(val_representations, cfg)
+    print(f"Creating dataset with {len(train_indices)} training examples and {len(val_indices)} validation examples")
     
-    # Create dataloaders
+    # Create datasets that compute activations on-demand
+    train_dataset = OnDeviceActivationsDataset(dataset, train_indices, model, tokenizer, cfg)
+    val_dataset = OnDeviceActivationsDataset(dataset, val_indices, model, tokenizer, cfg)
+    
+    # Define collate function to properly batch tensors
+    def collate_activations(batch):
+        """
+        Custom collate function to batch together tensors while ensuring
+        consistent shape [batch_size, seq_len, d_in]
+        """
+        # Each item in batch is already [1, seq_len, d_in]
+        # We need to concatenate along batch dimension
+        return torch.cat(batch, dim=0)
+    
+    # Create dataloaders with fewer workers for GPU dataset and custom collate function
+    # When keeping data on device, we need to use fewer workers to avoid CUDA issues
     train_loader = DataLoader(
         train_dataset,
         batch_size=cfg["batch_size"],
         shuffle=True,
-        num_workers=cfg.get("num_workers", 4)
+        # For on-device computation, using multiple workers can cause CUDA errors
+        # so we use fewer workers or none
+        num_workers=0,
+        collate_fn=collate_activations
     )
     
     val_loader = DataLoader(
         val_dataset,
         batch_size=cfg["batch_size"],
         shuffle=False,
-        num_workers=cfg.get("num_workers", 4)
+        num_workers=0,
+        collate_fn=collate_activations
     )
     
-    # Import the SplitSAE model here to avoid circular imports
-    from model import SplitSAE
-    
-    # Initialize the SplitSAE model
-    model_sae = SplitSAE(cfg)
-    
-    return train_loader, val_loader, model_sae
+    return train_loader, val_loader

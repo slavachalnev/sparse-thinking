@@ -6,7 +6,8 @@ import json
 from tqdm import tqdm
 import wandb
 import numpy as np
-from data_loader import load_data_and_model
+from data_loader import load_data_and_representations
+from model import SplitSAE
 
 def train(cfg):
     # Initialize wandb
@@ -20,8 +21,11 @@ def train(cfg):
     # Set random seed for reproducibility
     torch.manual_seed(cfg["seed"])
     
-    # Load data and model
-    train_loader, val_loader, model = load_data_and_model(cfg)
+    # Load data
+    train_loader, val_loader = load_data_and_representations(cfg)
+    
+    # Initialize the model
+    model = SplitSAE(cfg)
     
     # Setup optimizer
     optimizer = optim.Adam(
@@ -46,7 +50,7 @@ def train(cfg):
         epoch_recon_loss = 0
         
         for batch in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} - Training"):
-            batch = batch.to(device)
+            # No need to move batch to device as it's already on device
             
             # Forward pass
             losses = model.get_losses(batch)
@@ -80,7 +84,7 @@ def train(cfg):
         
         with torch.no_grad():
             for batch in tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} - Validation"):
-                batch = batch.to(device)
+                # No need to move batch to device as it's already on device
                 
                 # Forward pass
                 losses = model.get_losses(batch)

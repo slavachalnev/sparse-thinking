@@ -21,8 +21,5 @@
   "layer_idx": -1,
   "max_examples": 1000,
   "train_ratio": 0.8,
-  "cache_path": "representations_cache.pt",
-  "use_cache": true,
-  "cache_representations": true,
   "num_workers": 4
 }
